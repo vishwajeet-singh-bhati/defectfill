@@ -1,0 +1,43 @@
+# ============================================================
+# DefectFill for Steel Weld Defect Dataset
+# requirements.txt
+# ============================================================
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Hugging Face ecosystem — provides Stable Diffusion, LoRA, tokenizers
+diffusers==0.27.2          # Stable Diffusion pipelines (SD2-inpainting)
+transformers==4.39.3       # CLIP text encoder, tokenizers
+accelerate==0.28.0         # Multi-GPU / mixed precision training
+peft==0.10.0               # LoRA (Low-Rank Adaptation) via PEFT library
+safetensors==0.4.2         # Fast weight loading/saving format
+
+# Image processing
+Pillow>=10.0.0             # PIL image I/O
+opencv-python>=4.8.0       # Bounding box drawing, morphological ops on masks
+albumentations>=1.3.1      # Image augmentations (flip, brightness, contrast)
+scikit-image>=0.21.0       # SSIM, structural image operations
+
+# Metrics
+lpips==0.1.4               # Learned Perceptual Image Patch Similarity (for LFS + IC-LPIPS)
+torchmetrics>=1.2.0        # AUROC, AP, F1, precision-recall curves
+scipy>=1.11.0              # KID (Kernel Inception Distance) statistical computations
+clean-fid>=0.1.35           # FID/KID computation using clean-fid library
+
+# Data handling
+numpy>=1.24.0
+pandas>=2.0.0
+PyYAML>=6.0                # config.yaml loading
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tqdm>=4.65.0               # Progress bars
+
+# XML parsing (for PASCAL VOC format annotations)
+lxml>=4.9.0
+
+# Experiment tracking (optional but recommended)
+# wandb>=0.16.0            # Uncomment to enable W&B logging

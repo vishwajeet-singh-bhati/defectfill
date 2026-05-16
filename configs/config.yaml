@@ -1,0 +1,135 @@
+# ============================================================
+# configs/config.yaml
+# Central configuration for DefectFill on Steel Weld Dataset
+# ============================================================
+
+# ── Dataset ──────────────────────────────────────────────────
+dataset:
+  root: "./steel-tube-dataset-all/yolo"          # Unzipped dataset root
+  images_dir: "images"                      # Subfolder with JPG/PNG images
+  labels_dir: "labels"                      # Subfolder with YOLO .txt labels
+  image_ext: ".jpg"                         # Image file extension
+  img_size: 512                             # Resize to this for SD inpainting
+  grayscale_to_rgb: true                    # X-ray images are grayscale; SD needs 3ch
+
+  # 8 defect class names (matches YOLO label indices 0-7)
+  class_names:
+    - air-hole        # 0 — 5191 samples (abundant; model uses these as "normal" backdrop)
+    - bite-edge       # 1 — 35 samples   (extremely scarce; highest priority for generation)
+    - broken-arc      # 2 — 458 samples
+    - crack           # 3 — 119 samples
+    - hollow-bead     # 4 — 229 samples
+    - overlap         # 5 — 223 samples
+    - slag-inclusion  # 6 — 120 samples
+    - unfused         # 7 — 408 samples
+
+  # Split: 1/3 of defect images used as reference for learning,
+  # 2/3 used as target backgrounds for generation (mirrors the paper's MVTec setup)
+  reference_split: 0.33
+  seed: 42
+
+  # Mask generation from bounding boxes
+  # "bbox"   → fill the entire bounding box as mask
+  # "dilated" → dilate bbox by dilation_factor for looser mask
+  mask_mode: "dilated"
+  dilation_factor: 1.15   # 15% larger than tight bbox — gives model breathing room
+
+# ── Stable Diffusion Base Model ───────────────────────────────
+model:
+  base_model_id: "sd2-community/stable-diffusion-2-inpainting"  # FIX: original repo deleted, use community mirror
+
+  # LoRA configuration (fine-tunes only attention + text encoder)
+  lora:
+    rank: 8              # LoRA rank (paper uses 8)
+    alpha: 8             # LoRA scaling alpha (usually == rank)
+    target_modules:      # Which layers to apply LoRA to
+      - "to_q"
+      - "to_v"
+      - "to_k"
+      - "to_out.0"
+      - "ff.net.0.proj"
+      - "ff.net.2"
+
+  # Token representing the learned defect concept
+  placeholder_token: "[V*]"
+
+# ── Text Prompts ──────────────────────────────────────────────
+prompts:
+  # Defect prompt: focuses model on defect features only
+  # Paper uses "A photo of [V*]"; adapted for X-ray domain
+  defect_template: "An X-ray image showing {placeholder} defect"
+
+  # Object prompt: provides semantic context (object + defect relationship)
+  # Paper uses "A [Object] with [V*]"
+  object_template: "An X-ray of a steel pipe weld with {placeholder} defect"
+
+# ── Training (Fine-tuning) ────────────────────────────────────
+training:
+  output_dir: "./outputs/checkpoints"
+  num_train_steps: 400        # Steps per defect class (paper ~400 steps for few-shot)
+  batch_size: 1               # Memory-constrained; SD inpainting is large
+  gradient_accumulation: 4    # Effective batch = 4
+  mixed_precision: "fp16"     # Use half precision to fit in VRAM
+
+  # Learning rates (paper: 2e-4 for UNet, 4e-5 for text encoder)
+  lr_unet: 2.0e-4
+  lr_text_encoder: 4.0e-5
+  lr_scheduler: "constant"
+  warmup_steps: 0
+
+  # DefectFill loss weights (paper: λ_def=0.5, λ_obj=0.2, λ_attn=0.05)
+  lambda_def: 0.5
+  lambda_obj: 0.2
+  lambda_attn: 0.05
+
+  # Object loss: weight applied to background (non-defect) regions
+  # Paper uses α < 1 to prioritize defect region but keep background context
+  alpha_bg: 0.1
+
+  # Number of random boxes for object loss Mrand
+  num_random_boxes: 30
+
+  # Save checkpoint every N steps
+  save_steps: 100
+  log_steps: 10
+
+# ── Generation (Inference) ────────────────────────────────────
+generation:
+  output_dir: "./outputs/generated"
+  num_samples_per_class: 1000   # Target images to generate per defect class
+  num_candidates: 8             # LFS: generate N candidates, keep the best
+  ddim_steps: 50                # DDIM denoising steps (paper uses 50)
+  guidance_scale: 7.5           # Classifier-free guidance scale
+  seed: 0                       # Base seed (incremented per sample)
+
+  # Low-Fidelity Selection metric: "lpips" | "ssim" | "psnr"
+  lfs_metric: "lpips"
+  # LPIPS: pick highest score (most different from input = most defect-like)
+  # SSIM/PSNR: pick lowest score (same idea)
+
+# ── Downstream: Classification ────────────────────────────────
+classification:
+  model: "resnet34"             # Paper uses ResNet-34
+  pretrained: true
+  num_classes: 8
+  epochs: 50
+  batch_size: 32
+  lr: 1.0e-4
+  output_dir: "./outputs/results/classification"
+
+# ── Downstream: Localization ─────────────────────────────────
+localization:
+  model: "unet"                 # Paper uses UNet
+  encoder: "resnet34"
+  in_channels: 3
+  num_classes: 1                # Binary: defect or not
+  epochs: 50
+  batch_size: 8
+  lr: 1.0e-4
+  focal_loss_gamma: 2.0         # Paper uses focal loss for localization
+  output_dir: "./outputs/results/localization"
+
+# ── Evaluation ───────────────────────────────────────────────
+evaluation:
+  kid_num_samples: 1000         # Paper evaluates KID on 1000 generated images
+  results_dir: "./outputs/results"

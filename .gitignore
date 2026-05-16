@@ -1,0 +1,19 @@
+# Model weights & HuggingFace cache
+outputs/
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+
+# Dataset
+steel-tube-dataset-all/
+data_prepared/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Mac
+.DS_Store
