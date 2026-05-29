@@ -1,35 +1,32 @@
 """
 generate.py
 ───────────
-Generate synthetic weld defect images using fine-tuned DefectFill models.
+Generate synthetic defect images using fine-tuned DefectFill models
+on the MVTec AD dataset.
 
-This script implements Section 3.3 of the paper: "Generating Defect".
-
-Pipeline per defect class:
-  1. Load fine-tuned LoRA weights for the class.
-  2. For each "target" image (the 2/3 split not used for training):
-       a. Choose a mask — either from the existing YOLO annotation (same location)
-          or draw a custom shape mask to test generalisation.
-       b. Generate N candidates using DDIM (50 steps).
-       c. Apply Low-Fidelity Selection → pick the most defect-like candidate.
-       d. Save the selected image + mask as a training pair.
-  3. Continue until num_samples_per_class images are generated.
-
-The generated dataset augments the original, enabling downstream classifiers
-and localisers to be trained on far more defect examples.
+Pipeline per (object, defect_type):
+1. Load fine-tuned LoRA weights for the run.
+2. For each mask in the "target" split (2/3 not used for training):
+   a. Pick a random NORMAL image as the background (paper setup).
+   b. Load the pixel-perfect ground-truth mask from MVTec.
+   c. Generate N candidates using DDIM (50 steps).
+   d. Apply Low-Fidelity Selection → pick the most defect-like candidate.
+   e. Save the selected image + mask.
+3. Continue until num_samples images are generated.
 
 Run:
     python generate.py --config configs/config.yaml
-    python generate.py --config configs/config.yaml --class_id 1 --num_samples 200
-    python generate.py --config configs/config.yaml --custom_masks  # use star/square masks
+    python generate.py --config configs/config.yaml --object hazelnut --defect_type crack --num_samples 200
+    python generate.py --config configs/config.yaml --custom_masks   # use star/square masks
 """
 
 import argparse
 import os
 import sys
 import json
+import random
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import cv2
 import numpy as np
@@ -40,10 +37,10 @@ from tqdm import tqdm
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
+
 from data.dataset import (
-    build_class_samples,
-    yolo_bbox_to_pixel,
-    bbox_to_mask,
+    build_defect_samples,
+    get_normal_images,
     gray_to_rgb,
 )
 from models.defectfill import DefectFillModel
@@ -56,18 +53,8 @@ def make_shape_mask(img_size: int, shape: str, cx: int, cy: int, size: int = 60)
     """
     Create a mask with a geometric shape (star, square, circle, ellipse).
     Used to test if DefectFill can generalise to unseen mask shapes at inference.
-
     The paper demonstrates this in Figure 1 — defects are generated in star
     and square shapes even though training masks were all irregular blobs.
-
-    Args:
-        img_size:  Output mask size (square: img_size × img_size).
-        shape:     One of "square", "circle", "ellipse", "star".
-        cx, cy:    Centre of the shape.
-        size:      Approximate radius / half-width.
-
-    Returns:
-        mask: uint8 (img_size, img_size), 255=defect.
     """
     mask = np.zeros((img_size, img_size), dtype=np.uint8)
     if shape == "square":
@@ -77,15 +64,15 @@ def make_shape_mask(img_size: int, shape: str, cx: int, cy: int, size: int = 60)
     elif shape == "ellipse":
         cv2.ellipse(mask, (cx, cy), (size, size // 2), 0, 0, 360, 255, -1)
     elif shape == "star":
-        pts = []
         import math
+        pts = []
         for i in range(5):
             outer_angle = math.pi / 2 + i * 2 * math.pi / 5
             inner_angle = outer_angle + math.pi / 5
             pts.append((int(cx + size * math.cos(outer_angle)),
-                         int(cy - size * math.sin(outer_angle))))
+                        int(cy - size * math.sin(outer_angle))))
             pts.append((int(cx + size * 0.4 * math.cos(inner_angle)),
-                         int(cy - size * 0.4 * math.sin(inner_angle))))
+                        int(cy - size * 0.4 * math.sin(inner_angle))))
         pts = np.array(pts, dtype=np.int32)
         cv2.fillPoly(mask, [pts], 255)
     return mask
@@ -103,13 +90,12 @@ class DefectGenerator:
     """
 
     def __init__(self, config: dict, device: torch.device):
-        self.config = config
-        self.device = device
-        self.gen_cfg = config["generation"]
-        self.img_size = config["dataset"]["img_size"]
+        self.config      = config
+        self.device      = device
+        self.gen_cfg     = config["generation"]
+        self.img_size    = config["dataset"]["img_size"]
         self.placeholder = config["model"]["placeholder_token"]
 
-        # Build the full pipeline (VAE + UNet + text encoder + scheduler)
         print("  Loading SD2-inpainting pipeline...")
         self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
             config["model"]["base_model_id"],
@@ -117,7 +103,7 @@ class DefectGenerator:
             safety_checker=None,
         ).to(device)
 
-        # Replace scheduler with DDIM for faster, deterministic inference
+        # Replace scheduler with DDIM
         self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
 
         # LFS quality selector
@@ -126,53 +112,39 @@ class DefectGenerator:
             device=str(device),
         )
 
-    def load_class_weights(self, class_name: str, ckpt_dir: str):
+    def load_class_weights(self, run_name: str, ckpt_dir: str):
         """
-        Hot-swap the LoRA weights for a given defect class into the pipeline.
-        This avoids reloading the full ~4GB model for each class.
+        Hot-swap LoRA weights for a given (object, defect_type) run into the pipeline.
+        run_name: e.g. "hazelnut_crack"
         """
         from peft import PeftModel
-        # Load LoRA-wrapped UNet
+
         self.pipe.unet = PeftModel.from_pretrained(
             self.pipe.unet,
-            f"{ckpt_dir}/{class_name}_unet_lora",
+            f"{ckpt_dir}/{run_name}_unet_lora",
         ).to(self.device)
-        # Load LoRA-wrapped text encoder + [V*] embedding
+
         self.pipe.text_encoder = PeftModel.from_pretrained(
             self.pipe.text_encoder,
-            f"{ckpt_dir}/{class_name}_te_lora",
+            f"{ckpt_dir}/{run_name}_te_lora",
         ).to(self.device)
-        # Restore [V*] token embedding
+
         v_star_id = self.pipe.tokenizer.convert_tokens_to_ids(self.placeholder)
-        emb = torch.load(f"{ckpt_dir}/{class_name}_v_star_embedding.pt")
+        emb = torch.load(f"{ckpt_dir}/{run_name}_v_star_embedding.pt")
         self.pipe.text_encoder.get_input_embeddings().weight.data[v_star_id] = \
             emb.to(self.device)
-        print(f"  Loaded weights for: {class_name}")
+
+        print(f"  Loaded weights for: {run_name}")
 
     def generate_candidates(
         self,
-        image_pil: Image.Image,     # RGB PIL image
-        mask_pil: Image.Image,      # Grayscale mask PIL (255=defect)
+        image_pil: Image.Image,
+        mask_pil: Image.Image,
         prompt: str,
         n_candidates: int,
         seed_base: int = 0,
     ) -> List[Image.Image]:
-        """
-        Generate N candidate defect images using DDIM inpainting.
-
-        Each candidate uses a different seed so we get diverse results.
-        LFS will then pick the best one.
-
-        Args:
-            image_pil:    Background (defect-free) image.
-            mask_pil:     Mask indicating where to generate the defect.
-            prompt:       Object-context prompt for inference.
-            n_candidates: How many samples to generate.
-            seed_base:    Starting seed (each candidate gets seed_base + i).
-
-        Returns:
-            List of N PIL images (generated).
-        """
+        """Generate N candidate images with different seeds."""
         candidates = []
         for i in range(n_candidates):
             generator = torch.Generator(device=self.device).manual_seed(seed_base + i)
@@ -190,7 +162,7 @@ class DefectGenerator:
     def pil_to_tensor(self, img_pil: Image.Image) -> torch.Tensor:
         """PIL (H,W,3) → torch (1,3,H,W) in [-1,1]."""
         arr = np.array(img_pil.convert("RGB")).astype(np.float32)
-        t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+        t   = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
         return t
 
     def mask_pil_to_tensor(self, mask_pil: Image.Image) -> torch.Tensor:
@@ -198,89 +170,104 @@ class DefectGenerator:
         arr = np.array(mask_pil.convert("L")).astype(np.float32) / 255.0
         return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
-    def generate_for_class(
+    def generate_for_defect(
         self,
-        class_id: int,
+        object_name: str,
+        defect_type: str,
         ckpt_dir: str,
         num_samples: int,
         use_custom_masks: bool = False,
     ):
         """
-        Full generation pipeline for one defect class.
+        Full generation pipeline for one (object, defect_type) pair.
 
-        Saves generated images and masks to:
-            outputs/generated/{class_name}/images/
-            outputs/generated/{class_name}/masks/
+        Paper setup:
+          - Use TARGET split masks (pixel-perfect ground-truth)
+          - Apply masks onto NORMAL background images (from train/good/)
+          - Generate 1000 images per defect category
+
+        Saves to:
+          outputs/generated/{object_name}/{defect_type}/images/
+          outputs/generated/{object_name}/{defect_type}/masks/
         """
-        class_name = self.config["dataset"]["class_names"][class_id]
+        run_name     = f"{object_name}_{defect_type}"
         dataset_root = self.config["dataset"]["root"]
-        out_dir = Path(self.gen_cfg["output_dir"]) / class_name
+
+        # Output directories
+        out_dir = Path(self.gen_cfg["output_dir"]) / object_name / defect_type
         (out_dir / "images").mkdir(parents=True, exist_ok=True)
         (out_dir / "masks").mkdir(parents=True, exist_ok=True)
 
-        print(f"\n  Generating class [{class_name}]  target={num_samples} images")
+        print(f"\n  Generating [{run_name}] — target={num_samples} images")
 
-        # Load class-specific LoRA weights
-        self.load_class_weights(class_name, ckpt_dir)
+        # Load LoRA weights for this run
+        self.load_class_weights(run_name, ckpt_dir)
 
-        # Get target images (2/3 split — these are used as backgrounds)
-        _, target_samples = build_class_samples(dataset_root, class_id, self.config)
+        # Get target split: these provide the MASKS to use
+        _, target_samples = build_defect_samples(
+            dataset_root, object_name, defect_type, self.config
+        )
         if not target_samples:
-            print(f"  [WARN] No target samples for {class_name}, skipping.")
+            print(f"  [WARN] No target samples for {run_name}, skipping.")
             return
 
-        # Object prompt for inference (same as training)
-        object_prompt = self.config["prompts"]["object_template"].format(
-            placeholder=self.placeholder
-        )
+        # Get normal (defect-free) images to use as backgrounds — paper setup
+        normal_images = get_normal_images(dataset_root, object_name)
+        if not normal_images:
+            print(f"  [WARN] No normal images found for {object_name}, skipping.")
+            return
 
-        n_candidates = self.gen_cfg["num_candidates"]
+        # Object-context prompt: "A hazelnut with [V*]"
+        object_prefix = self.config["dataset"]["object_prompts"][object_name]
+        object_prompt = f"{object_prefix} {self.placeholder}"
+
+        n_candidates    = self.gen_cfg["num_candidates"]
         generated_count = 0
-        img_index = 0
-        pbar = tqdm(total=num_samples, desc=f"  [{class_name}]", unit="img")
+        img_index       = 0
+
+        pbar = tqdm(total=num_samples, desc=f"  [{run_name}]", unit="img")
 
         while generated_count < num_samples:
             # Cycle through target samples
             sample = target_samples[img_index % len(target_samples)]
             img_index += 1
 
-            # Load image
-            img_bgr = cv2.imread(sample.image_path)
-            if img_bgr is None:
-                continue
-            img_h, img_w = img_bgr.shape[:2]
-            img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            img_rgb = gray_to_rgb(img_gray)
-
             # ── Choose mask ────────────────────────────────────────────────
             if use_custom_masks:
-                # Generate a random geometric mask shape
                 shape = SHAPE_CYCLE[generated_count % len(SHAPE_CYCLE)]
-                cx = np.random.randint(self.img_size // 4, 3 * self.img_size // 4)
-                cy = np.random.randint(self.img_size // 4, 3 * self.img_size // 4)
-                size = np.random.randint(20, 60)
+                cx    = np.random.randint(self.img_size // 4, 3 * self.img_size // 4)
+                cy    = np.random.randint(self.img_size // 4, 3 * self.img_size // 4)
+                size  = np.random.randint(20, 60)
                 mask_arr = make_shape_mask(self.img_size, shape, cx, cy, size)
             else:
-                # Use annotation-based mask (dilated bbox)
-                bboxes_px = [
-                    yolo_bbox_to_pixel(bn, img_w, img_h)
-                    for cid, bn in zip(sample.class_ids, sample.bboxes_norm)
-                    if cid == class_id
-                ]
-                if not bboxes_px:
+                # Load pixel-perfect ground-truth mask from MVTec
+                mask_arr = cv2.imread(sample.mask_path, cv2.IMREAD_GRAYSCALE)
+                if mask_arr is None:
                     continue
-                mask_arr = bbox_to_mask(
-                    bboxes_px, img_h, img_w,
-                    self.config["dataset"].get("dilation_factor", 1.15)
-                )
+                # Normalise to 0/255
+                if mask_arr.max() <= 1:
+                    mask_arr = (mask_arr * 255).astype(np.uint8)
 
-            # Resize
-            img_resized = cv2.resize(img_rgb, (self.img_size, self.img_size))
+            # ── Use a random NORMAL image as background (paper setup) ──────
+            normal_path = random.choice(normal_images)
+            img_bgr     = cv2.imread(normal_path)
+            if img_bgr is None:
+                continue
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+            # Handle grayscale MVTec objects (zipper, screw, grid)
+            grayscale_objects = self.config["dataset"].get("grayscale_objects", [])
+            if object_name in grayscale_objects:
+                if img_rgb.ndim == 2 or (img_rgb.ndim == 3 and img_rgb.shape[2] == 1):
+                    img_rgb = gray_to_rgb(img_rgb)
+
+            # ── Resize ────────────────────────────────────────────────────
+            img_resized  = cv2.resize(img_rgb,  (self.img_size, self.img_size))
             mask_resized = cv2.resize(mask_arr, (self.img_size, self.img_size),
                                       interpolation=cv2.INTER_NEAREST)
 
-            # Convert to PIL for diffusers pipeline
-            img_pil = Image.fromarray(img_resized.astype(np.uint8))
+            # ── Convert to PIL ────────────────────────────────────────────
+            img_pil  = Image.fromarray(img_resized.astype(np.uint8))
             mask_pil = Image.fromarray(mask_resized)
 
             # ── Generate N candidates ─────────────────────────────────────
@@ -293,16 +280,15 @@ class DefectGenerator:
             )
 
             # ── LFS: pick the best candidate ──────────────────────────────
-            # Convert candidates to tensors for LPIPS comparison
-            orig_tensor = self.pil_to_tensor(img_pil)
-            mask_tensor = self.mask_pil_to_tensor(mask_pil)
+            orig_tensor  = self.pil_to_tensor(img_pil)
+            mask_tensor  = self.mask_pil_to_tensor(mask_pil)
             cand_tensors = [self.pil_to_tensor(c) for c in candidates_pil]
 
             best_idx, best_score = self.selector.select(cand_tensors, orig_tensor, mask_tensor)
             best_img_pil = candidates_pil[best_idx]
 
             # ── Save ──────────────────────────────────────────────────────
-            stem = f"{class_name}_{generated_count:05d}"
+            stem = f"{object_name}_{defect_type}_{generated_count:05d}"
             best_img_pil.save(str(out_dir / "images" / f"{stem}.png"))
             mask_pil.save(str(out_dir / "masks" / f"{stem}.png"))
 
@@ -316,49 +302,60 @@ class DefectGenerator:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate defect images with DefectFill")
-    parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--class_id", type=int, default=None,
-                        help="Generate for only this class ID. Default: all.")
-    parser.add_argument("--num_samples", type=int, default=None,
+    parser = argparse.ArgumentParser(description="Generate defect images with DefectFill (MVTec AD)")
+    parser.add_argument("--config",       default="configs/config.yaml")
+    parser.add_argument("--object",       type=str, default=None,
+                        help="Generate for only this object, e.g. 'hazelnut'. Default: all.")
+    parser.add_argument("--defect_type",  type=str, default=None,
+                        help="Generate for only this defect type. Default: all.")
+    parser.add_argument("--num_samples",  type=int, default=None,
                         help="Override num_samples_per_class from config.")
     parser.add_argument("--custom_masks", action="store_true",
                         help="Use geometric masks (star/square) to test generalisation.")
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device",       default="auto")
     args = parser.parse_args()
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") \
-             if args.device == "auto" else torch.device(args.device)
+        if args.device == "auto" else torch.device(args.device)
     print(f"Device: {device}")
 
-    num_samples = args.num_samples or config["generation"]["num_samples_per_class"]
-    ckpt_dir = config["training"]["output_dir"]
-    class_names = config["dataset"]["class_names"]
+    num_samples  = args.num_samples or config["generation"]["num_samples_per_class"]
+    ckpt_dir     = config["training"]["output_dir"]
+    objects      = config["dataset"]["objects"]
+    defect_types = config["dataset"]["defect_types"]
 
-    # Initialise generator (loads base SD pipeline once)
+    # Filter by --object / --defect_type flags
+    if args.object:
+        if args.object not in objects:
+            raise ValueError(f"Unknown object '{args.object}'. Valid: {objects}")
+        objects = [args.object]
+    if args.defect_type:
+        defect_types = {obj: [args.defect_type] for obj in objects}
+
+    # Initialise generator (loads base SD pipeline once, then hot-swaps LoRA per run)
     generator = DefectGenerator(config=config, device=device)
 
-    class_ids = [args.class_id] if args.class_id is not None else list(range(len(class_names)))
+    for object_name in objects:
+        for defect_type in defect_types[object_name]:
+            run_name  = f"{object_name}_{defect_type}"
+            ckpt_path = Path(ckpt_dir) / f"{run_name}_unet_lora"
+            if not ckpt_path.exists():
+                print(f"  [SKIP] No checkpoint found for: {run_name}  (run train.py first)")
+                continue
 
-    for class_id in class_ids:
-        ckpt_path = Path(ckpt_dir) / f"{class_names[class_id]}_unet_lora"
-        if not ckpt_path.exists():
-            print(f"  [SKIP] No checkpoint found for: {class_names[class_id]}")
-            print(f"         Run train.py first.")
-            continue
-
-        generator.generate_for_class(
-            class_id=class_id,
-            ckpt_dir=ckpt_dir,
-            num_samples=num_samples,
-            use_custom_masks=args.custom_masks,
-        )
+            generator.generate_for_defect(
+                object_name=object_name,
+                defect_type=defect_type,
+                ckpt_dir=ckpt_dir,
+                num_samples=num_samples,
+                use_custom_masks=args.custom_masks,
+            )
 
     print(f"\n{'='*60}")
-    print("  Generation complete!  Run evaluate.py next.")
+    print("  Generation complete! Run evaluate.py next.")
     print(f"{'='*60}\n")
 
 
